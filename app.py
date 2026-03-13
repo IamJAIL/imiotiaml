@@ -1,152 +1,184 @@
-# app.py
+```python
 import streamlit as st
 import pandas as pd
-import numpy as np
-import threading
-import time
 from datetime import datetime
-import plotly.graph_objects as go
-from tensorflow.keras.models import load_model
-from tensorflow.keras.losses import MeanSquaredError
 import smtplib
 from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import os
 
-# ────────────────────────────────────────────────────────────────
-# CONFIGURACIÓN (variables seguras desde secrets o env)
-# ────────────────────────────────────────────────────────────────
-EMAIL_FROM = 'joshinanlo@gmail.com'
-EMAIL_TO = 'joshinanlo@gmail.com'
-APP_PASSWORD = os.environ.get("APP_PASSWORD") or st.secrets.get("APP_PASSWORD", "lvchktwnenwvgdje")
+# -----------------------------
+# CONFIGURACIÓN GENERAL
+# -----------------------------
 
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1K7ITGY2xAKidO52i8VPNpkZKbpMi9CvME5pfZSuLsQM/export?format=csv&gid=0"
-LIMITE_MENSUAL_M3 = 15.0  # 5 personas × 3 m³
+st.set_page_config(
+    page_title="Monitor Inteligente de Agua",
+    layout="wide"
+)
 
-# Cargar modelo (debe estar en el repositorio)
-@st.cache_resource
-def cargar_modelo():
-    try:
-        model = load_model('modelo_anomalias_agua.h5', compile=False)
-        model.compile(optimizer='adam', loss=MeanSquaredError())
-        return model
-    except Exception as e:
-        st.error(f"Error cargando modelo: {e}")
-        return None
+st.title("🚰 Monitor Inteligente de Consumo de Agua")
 
-model = cargar_modelo()
+# URL del Google Sheet en formato CSV
+URL = "https://docs.google.com/spreadsheets/d/1K7ITGY2xAKidO52i8VPNpkZKbpMi9CvME5pfZSuLsQM/export?format=csv&gid=0"
 
-# Variables de estado para dashboard
-if 'consumo_actual' not in st.session_state:
-    st.session_state.update({
-        'consumo_actual': 0.0,
-        'porcentaje': 0.0,
-        'mse_actual': 0.0,
-        'estado': "Normal",
-        'hist_mse': [],
-        'hist_consumo': [],
-        'ultima_actualizacion': datetime.now()
-    })
+# correo destino
+EMAIL_DESTINO = "joshinanlo@gmail.com"
 
-# ────────────────────────────────────────────────────────────────
-# FUNCIÓN DE ALERTA POR EMAIL
-# ────────────────────────────────────────────────────────────────
-def enviar_alerta_email(mse, consumo):
-    try:
-        subject = f"🚨 ALERTA - Posible Fuga o Sobreconsumo ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
-        body = f"""¡Atención!
+# correo emisor (configurar)
+EMAIL_ORIGEN = "sistemaagua@gmail.com"
+EMAIL_PASSWORD = "APP_PASSWORD"
 
-MSE detectado: {mse:.6f}
-Consumo acumulado: {consumo:.2f} m³ ({st.session_state.porcentaje:.1f}% del límite de 15 m³)
-Estado: {st.session_state.estado}
+# límite mensual
+LIMITE_CONSUMO = 15
 
-Revisa el consumo de agua urgentemente.
-Sensor: Google Sheet ID 1K7ITGY2xAKidO52i8VPNpkZKbpMi9CvME5pfZSuLsQM
-"""
-        msg = MIMEMultipart()
-        msg['From'] = EMAIL_FROM
-        msg['To'] = EMAIL_TO
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
 
-        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-        server.login(EMAIL_FROM, APP_PASSWORD)
-        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-        server.quit()
-        st.success("Alerta enviada por email")
-    except Exception as e:
-        st.error(f"Error enviando email: {e}")
+# -----------------------------
+# FUNCIONES
+# -----------------------------
 
-# ────────────────────────────────────────────────────────────────
-# HILO DE MONITOREO EN BACKGROUND
-# ────────────────────────────────────────────────────────────────
-def monitoreo_background():
-    while True:
-        try:
-            df = pd.read_csv(SHEET_URL)
-            df['timestamp'] = pd.to_datetime(df['date_id'].astype(str) + ' ' + df['start_time'].astype(str), errors='coerce')
-            df = df.dropna(subset=['timestamp'])
-            df = df[['timestamp', 'total_liters']].sort_values('timestamp').drop_duplicates(subset=['timestamp'])
-            df.set_index('timestamp', inplace=True)
-            series = df['total_liters'].resample('5T').last().ffill()
-            consumption = series.diff().fillna(0)
+def enviar_alerta(mensaje_texto):
 
-            if len(consumption) >= 288 and model is not None:
-                last_seq = consumption[-288:].values.reshape(1, 288, 1)
-                last_scaled = scaler.transform(last_seq.reshape(-1, 1)).reshape(1, 288, 1)  # Asume scaler cargado o ajusta
+    mensaje = MIMEText(mensaje_texto)
 
-                pred = model.predict(last_scaled, verbose=0)
-                mse = np.mean(np.power(last_scaled - pred, 2))
+    mensaje['Subject'] = "ALERTA CONSUMO DE AGUA"
+    mensaje['From'] = EMAIL_ORIGEN
+    mensaje['To'] = EMAIL_DESTINO
 
-                # Actualizar estado
-                consumo_m3 = series.iloc[-1] / 1000  # litros a m³
-                porcentaje = (consumo_m3 / LIMITE_MENSUAL_M3) * 100
+    servidor = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+    servidor.login(EMAIL_ORIGEN, EMAIL_PASSWORD)
 
-                st.session_state.consumo_actual = consumo_m3
-                st.session_state.porcentaje = porcentaje
-                st.session_state.mse_actual = mse
-                st.session_state.hist_mse.append(mse)
-                st.session_state.hist_consumo.append(consumo_m3)
-                st.session_state.ultima_actualizacion = datetime.now()
+    servidor.send_message(mensaje)
 
-                if len(st.session_state.hist_mse) > 200:
-                    st.session_state.hist_mse.pop(0)
-                    st.session_state.hist_consumo.pop(0)
+    servidor.quit()
 
-                # Alertas
-                if mse > threshold or porcentaje > 90:
-                    estado = "¡ALERTA!" if mse > threshold else "Cerca del límite"
-                    enviar_alerta_email(mse, consumo_m3)
-                else:
-                    st.session_state.estado = "Normal"
 
-        except Exception as e:
-            print(f"Error en monitoreo: {e}")
-        time.sleep(60)
+def cargar_datos():
 
-# Iniciar hilo solo una vez
-if 'hilo_iniciado' not in st.session_state:
-    threading.Thread(target=monitoreo_background, daemon=True).start()
-    st.session_state.hilo_iniciado = True
+    df = pd.read_csv(URL)
 
-# ────────────────────────────────────────────────────────────────
-# INTERFAZ DASHBOARD
-# ────────────────────────────────────────────────────────────────
-col1, col2, col3 = st.columns(3)
-col1.metric("Consumo acumulado", f"{st.session_state.consumo_actual:.2f} m³", f"{st.session_state.porcentaje:.1f}% del límite")
-col2.metric("Estado del sistema", st.session_state.estado)
-col3.metric("Última actualización", st.session_state.ultima_actualizacion.strftime("%H:%M:%S"))
+    # convertir timestamp
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-st.subheader("Consumo acumulado vs Límite mensual")
-fig_consumo = go.Figure()
-fig_consumo.add_trace(go.Scatter(y=st.session_state.hist_consumo, mode='lines', name='Consumo (m³)'))
-fig_consumo.add_hline(y=LIMITE_MENSUAL_M3, line_dash="dash", line_color="red", annotation_text="Límite 15 m³")
-fig_consumo.update_layout(height=400)
-st.plotly_chart(fig_consumo, use_container_width=True)
+    return df
 
-st.subheader("Error MSE en vivo")
-fig_mse = go.Figure()
-fig_mse.add_trace(go.Scatter(y=st.session_state.hist_mse, mode='lines', name='MSE', line=dict(color='red')))
-st.plotly_chart(fig_mse, use_container_width=True)
 
-st.caption(f"App corriendo 24/7 en Render • Datos desde Google Sheets • Actualizado cada 60 segundos")
+# -----------------------------
+# CARGAR DATOS
+# -----------------------------
+
+df = cargar_datos()
+
+st.success("Datos cargados correctamente")
+
+# -----------------------------
+# DASHBOARD TIEMPO REAL
+# -----------------------------
+
+st.subheader("📈 Consumo en tiempo real")
+
+st.line_chart(
+    df.set_index("timestamp")["consumo_m3"]
+)
+
+# -----------------------------
+# CONSUMO DEL MES ACTUAL
+# -----------------------------
+
+df["mes"] = df["timestamp"].dt.month
+df["anio"] = df["timestamp"].dt.year
+
+mes_actual = datetime.now().month
+anio_actual = datetime.now().year
+
+df_mes = df[
+    (df["mes"] == mes_actual) &
+    (df["anio"] == anio_actual)
+]
+
+consumo_mes = df_mes["consumo_m3"].sum()
+
+col1, col2 = st.columns(2)
+
+col1.metric("Consumo del mes (m³)", round(consumo_mes, 3))
+col2.metric("Número de registros", len(df_mes))
+
+# -----------------------------
+# ALERTA POR CONSUMO EXCESIVO
+# -----------------------------
+
+if consumo_mes > LIMITE_CONSUMO:
+
+    st.error("⚠ Consumo mensual excesivo detectado")
+
+    mensaje = f"""
+    ALERTA DE CONSUMO DE AGUA
+
+    El consumo del mes actual ha superado el límite permitido.
+
+    Consumo actual: {consumo_mes} m3
+    Límite permitido: {LIMITE_CONSUMO} m3
+
+    Fecha: {datetime.now()}
+    """
+
+    enviar_alerta(mensaje)
+
+
+# -----------------------------
+# DETECCIÓN SIMPLE DE FUGAS
+# -----------------------------
+
+st.subheader("🔎 Detección de posibles fugas")
+
+df["flujo_promedio"] = df["consumo_m3"].rolling(30).mean()
+
+flujo_reciente = df["flujo_promedio"].iloc[-1]
+
+if flujo_reciente > 0.02:
+
+    st.warning("⚠ Posible fuga detectada (flujo constante)")
+
+    mensaje = f"""
+    POSIBLE FUGA DE AGUA DETECTADA
+
+    Flujo promedio reciente: {flujo_reciente}
+
+    Se detectó un consumo constante que podría indicar
+    una fuga en el sistema de distribución de agua.
+    """
+
+    enviar_alerta(mensaje)
+
+else:
+
+    st.success("No se detectan fugas en este momento")
+
+
+# -----------------------------
+# CONSUMO DIARIO
+# -----------------------------
+
+st.subheader("📊 Consumo diario")
+
+df["dia"] = df["timestamp"].dt.date
+
+consumo_diario = df.groupby("dia")["consumo_m3"].sum()
+
+st.bar_chart(consumo_diario)
+
+
+# -----------------------------
+# TABLA DE DATOS
+# -----------------------------
+
+st.subheader("📋 Datos recientes")
+
+st.dataframe(df.tail(50))
+
+
+# -----------------------------
+# ACTUALIZACIÓN AUTOMÁTICA
+# -----------------------------
+
+st.caption("Actualización automática cada 60 segundos")
+
+st.experimental_rerun()
+```
