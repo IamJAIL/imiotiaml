@@ -1,184 +1,247 @@
-```python
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+import numpy as np
+import os
 import smtplib
 from email.mime.text import MIMEText
+from datetime import datetime
+from sklearn.ensemble import IsolationForest
 
-# -----------------------------
-# CONFIGURACIÓN GENERAL
-# -----------------------------
+# -------------------------
+# CONFIGURACIÓN
+# -------------------------
 
-st.set_page_config(
-    page_title="Monitor Inteligente de Agua",
-    layout="wide"
-)
+st.set_page_config(page_title="Monitor Inteligente de Agua", layout="wide")
 
-st.title("🚰 Monitor Inteligente de Consumo de Agua")
-
-# URL del Google Sheet en formato CSV
 URL = "https://docs.google.com/spreadsheets/d/1K7ITGY2xAKidO52i8VPNpkZKbpMi9CvME5pfZSuLsQM/export?format=csv&gid=0"
 
-# correo destino
-EMAIL_DESTINO = "joshinanlo@gmail.com"
+EMAIL_FROM = "joshinanlo@gmail.com"
+EMAIL_TO = "joshinanlo@gmail.com"
+APP_PASSWORD = os.environ.get("APP_PASSWORD")
 
-# correo emisor (configurar)
-EMAIL_ORIGEN = "sistemaagua@gmail.com"
-EMAIL_PASSWORD = "APP_PASSWORD"
+LIMITE_MENSUAL = 15
 
-# límite mensual
-LIMITE_CONSUMO = 15
+st.title("🚰 Sistema Inteligente de Monitoreo de Agua")
 
+# -------------------------
+# FUNCIÓN DE ALERTA
+# -------------------------
 
-# -----------------------------
-# FUNCIONES
-# -----------------------------
+def enviar_alerta(asunto, mensaje):
 
-def enviar_alerta(mensaje_texto):
+    if APP_PASSWORD is None:
+        return
 
-    mensaje = MIMEText(mensaje_texto)
+    msg = MIMEText(mensaje)
 
-    mensaje['Subject'] = "ALERTA CONSUMO DE AGUA"
-    mensaje['From'] = EMAIL_ORIGEN
-    mensaje['To'] = EMAIL_DESTINO
+    msg["Subject"] = asunto
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
 
-    servidor = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-    servidor.login(EMAIL_ORIGEN, EMAIL_PASSWORD)
-
-    servidor.send_message(mensaje)
-
-    servidor.quit()
-
-
-def cargar_datos():
-
-    df = pd.read_csv(URL)
-
-    # convertir timestamp
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-    return df
+    try:
+        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
+        server.login(EMAIL_FROM, APP_PASSWORD)
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        server.quit()
+    except:
+        pass
 
 
-# -----------------------------
+# -------------------------
 # CARGAR DATOS
-# -----------------------------
+# -------------------------
 
-df = cargar_datos()
+try:
+    df = pd.read_csv(URL)
+except:
+    st.error("No se pudo leer el Google Sheet")
+    st.stop()
 
-st.success("Datos cargados correctamente")
+# detectar columnas
+timestamp_col = None
+flow_col = None
 
-# -----------------------------
-# DASHBOARD TIEMPO REAL
-# -----------------------------
+for c in df.columns:
+    if "time" in c.lower() or "fecha" in c.lower():
+        timestamp_col = c
+    if "m3" in c.lower() or "flow" in c.lower() or "consumo" in c.lower():
+        flow_col = c
 
-st.subheader("📈 Consumo en tiempo real")
+if timestamp_col is None or flow_col is None:
+    st.error("No se detectaron columnas correctas")
+    st.stop()
 
-st.line_chart(
-    df.set_index("timestamp")["consumo_m3"]
-)
+# limpiar datos
+df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+df = df.dropna()
 
-# -----------------------------
-# CONSUMO DEL MES ACTUAL
-# -----------------------------
+# -------------------------
+# FEATURE ENGINEERING
+# -------------------------
 
-df["mes"] = df["timestamp"].dt.month
-df["anio"] = df["timestamp"].dt.year
+df["hour"] = df[timestamp_col].dt.hour
+df["dayofweek"] = df[timestamp_col].dt.dayofweek
 
-mes_actual = datetime.now().month
-anio_actual = datetime.now().year
+df["rolling_mean"] = df[flow_col].rolling(20).mean()
+df["rolling_std"] = df[flow_col].rolling(20).std()
 
-df_mes = df[
-    (df["mes"] == mes_actual) &
-    (df["anio"] == anio_actual)
+df["diff_flow"] = df[flow_col].diff()
+
+df = df.dropna()
+
+features = df[
+    [
+        flow_col,
+        "hour",
+        "dayofweek",
+        "rolling_mean",
+        "rolling_std",
+        "diff_flow"
+    ]
 ]
 
-consumo_mes = df_mes["consumo_m3"].sum()
+# -------------------------
+# MODELO DE IA
+# -------------------------
+
+model = IsolationForest(
+    contamination=0.01,
+    n_estimators=200,
+    random_state=42
+)
+
+model.fit(features)
+
+df["anomaly"] = model.predict(features)
+
+anomalies = df[df["anomaly"] == -1]
+
+# -------------------------
+# DASHBOARD
+# -------------------------
+
+st.subheader("Consumo en tiempo real")
+
+st.line_chart(
+    df.set_index(timestamp_col)[flow_col]
+)
+
+# -------------------------
+# CONSUMO MENSUAL
+# -------------------------
+
+df["month"] = df[timestamp_col].dt.month
+df["year"] = df[timestamp_col].dt.year
+
+now = datetime.now()
+
+df_month = df[
+    (df["month"] == now.month) &
+    (df["year"] == now.year)
+]
+
+monthly_consumption = df_month[flow_col].sum()
 
 col1, col2 = st.columns(2)
 
-col1.metric("Consumo del mes (m³)", round(consumo_mes, 3))
-col2.metric("Número de registros", len(df_mes))
+col1.metric("Consumo del mes (m³)", round(monthly_consumption,2))
+col2.metric("Registros analizados", len(df))
 
-# -----------------------------
-# ALERTA POR CONSUMO EXCESIVO
-# -----------------------------
+# -------------------------
+# ALERTA DE CONSUMO
+# -------------------------
 
-if consumo_mes > LIMITE_CONSUMO:
+if monthly_consumption > LIMITE_MENSUAL:
 
-    st.error("⚠ Consumo mensual excesivo detectado")
+    st.error("⚠ Consumo mensual excedido")
 
-    mensaje = f"""
-    ALERTA DE CONSUMO DE AGUA
+    enviar_alerta(
+        "Alerta consumo de agua",
+        f"El consumo mensual ha excedido {LIMITE_MENSUAL} m3.\nConsumo actual: {monthly_consumption}"
+    )
 
-    El consumo del mes actual ha superado el límite permitido.
+# -------------------------
+# ANOMALÍAS IA
+# -------------------------
 
-    Consumo actual: {consumo_mes} m3
-    Límite permitido: {LIMITE_CONSUMO} m3
+st.subheader("Detección de anomalías por IA")
 
-    Fecha: {datetime.now()}
-    """
+if len(anomalies) > 0:
 
-    enviar_alerta(mensaje)
+    st.warning("Se detectaron anomalías en el consumo")
 
+    st.dataframe(
+        anomalies[[timestamp_col, flow_col]].tail(20)
+    )
 
-# -----------------------------
-# DETECCIÓN SIMPLE DE FUGAS
-# -----------------------------
-
-st.subheader("🔎 Detección de posibles fugas")
-
-df["flujo_promedio"] = df["consumo_m3"].rolling(30).mean()
-
-flujo_reciente = df["flujo_promedio"].iloc[-1]
-
-if flujo_reciente > 0.02:
-
-    st.warning("⚠ Posible fuga detectada (flujo constante)")
-
-    mensaje = f"""
-    POSIBLE FUGA DE AGUA DETECTADA
-
-    Flujo promedio reciente: {flujo_reciente}
-
-    Se detectó un consumo constante que podría indicar
-    una fuga en el sistema de distribución de agua.
-    """
-
-    enviar_alerta(mensaje)
+    enviar_alerta(
+        "Anomalía detectada",
+        "El sistema de IA detectó un comportamiento anormal en el consumo de agua."
+    )
 
 else:
 
-    st.success("No se detectan fugas en este momento")
+    st.success("No se detectaron anomalías")
 
+# -------------------------
+# DETECCIÓN DE FUGA NOCTURNA
+# -------------------------
 
-# -----------------------------
+st.subheader("Análisis de fugas nocturnas")
+
+night_data = df[
+    (df["hour"] >= 0) &
+    (df["hour"] <= 5)
+]
+
+night_mean = night_data[flow_col].mean()
+
+if night_mean > 0.02:
+
+    st.error("⚠ Posible fuga nocturna detectada")
+
+    enviar_alerta(
+        "Posible fuga de agua",
+        f"Se detectó consumo nocturno anormal.\nFlujo promedio: {night_mean}"
+    )
+
+else:
+
+    st.success("Consumo nocturno normal")
+
+# -------------------------
+# PERFIL DE CONSUMO
+# -------------------------
+
+st.subheader("Perfil de consumo por hora")
+
+hourly = df.groupby("hour")[flow_col].mean()
+
+st.bar_chart(hourly)
+
+# -------------------------
 # CONSUMO DIARIO
-# -----------------------------
+# -------------------------
 
-st.subheader("📊 Consumo diario")
+st.subheader("Consumo diario")
 
-df["dia"] = df["timestamp"].dt.date
+df["day"] = df[timestamp_col].dt.date
 
-consumo_diario = df.groupby("dia")["consumo_m3"].sum()
+daily = df.groupby("day")[flow_col].sum()
 
-st.bar_chart(consumo_diario)
+st.bar_chart(daily)
 
+# -------------------------
+# DATOS RECIENTES
+# -------------------------
 
-# -----------------------------
-# TABLA DE DATOS
-# -----------------------------
-
-st.subheader("📋 Datos recientes")
+st.subheader("Datos recientes")
 
 st.dataframe(df.tail(50))
 
+# -------------------------
+# REFRESCO AUTOMÁTICO
+# -------------------------
 
-# -----------------------------
-# ACTUALIZACIÓN AUTOMÁTICA
-# -----------------------------
+st.caption("Actualiza automáticamente al recargar la página")
 
-st.caption("Actualización automática cada 60 segundos")
-
-st.experimental_rerun()
-```
